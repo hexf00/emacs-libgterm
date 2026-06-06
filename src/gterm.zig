@@ -289,6 +289,13 @@ const GtermInstance = struct {
         self.terminal.colors.palette.changeDefault(palette);
         self.terminal.flags.dirty.palette = true;
     }
+
+    pub fn setDefaultColors(self: *GtermInstance, foreground: color.RGB, background: color.RGB) void {
+        self.terminal.colors.foreground.default = foreground;
+        self.terminal.colors.background.default = background;
+        self.terminal.flags.dirty.palette = true;
+        self.terminal.flags.dirty.clear = true;
+    }
 };
 
 // ── Color and style helpers ─────────────────────────────────────────
@@ -872,6 +879,26 @@ fn parseHexRgb(s: []const u8) ?color.RGB {
     };
 }
 
+fn parseHexRgbArg(env: *emacs.emacs_env, arg: emacs.emacs_value, message: []const u8) ?color.RGB {
+    var len: emacs.ptrdiff_t = 0;
+    _ = env.copy_string_contents.?(env, arg, null, &len);
+    if (emacs.check_exit(env)) return null;
+    if (len != 8) {
+        emacs.signal_error(env, "wrong-type-argument", message);
+        return null;
+    }
+
+    var buf: [8]u8 = undefined;
+    var copy_len = len;
+    _ = env.copy_string_contents.?(env, arg, &buf, &copy_len);
+    if (emacs.check_exit(env)) return null;
+
+    return parseHexRgb(buf[0..7]) orelse {
+        emacs.signal_error(env, "wrong-type-argument", message);
+        return null;
+    };
+}
+
 fn parsePalette16(env: *emacs.emacs_env, arg: emacs.emacs_value, out: *color.Palette) bool {
     var length_args = [_]emacs.emacs_value{arg};
     const length_val = env.funcall.?(env, env.intern.?(env, "length"), 1, &length_args);
@@ -894,23 +921,7 @@ fn parsePalette16(env: *emacs.emacs_env, arg: emacs.emacs_value, out: *color.Pal
         const color_val = env.funcall.?(env, env.intern.?(env, "nth"), 2, &nth_args);
         if (emacs.check_exit(env)) return false;
 
-        var len: emacs.ptrdiff_t = 0;
-        _ = env.copy_string_contents.?(env, color_val, null, &len);
-        if (emacs.check_exit(env)) return false;
-        if (len != 8) {
-            emacs.signal_error(env, "wrong-type-argument", "palette colors must be #RRGGBB strings");
-            return false;
-        }
-
-        var buf: [8]u8 = undefined;
-        var copy_len = len;
-        _ = env.copy_string_contents.?(env, color_val, &buf, &copy_len);
-        if (emacs.check_exit(env)) return false;
-
-        out[i] = parseHexRgb(buf[0..7]) orelse {
-            emacs.signal_error(env, "wrong-type-argument", "palette colors must be #RRGGBB strings");
-            return false;
-        };
+        out[i] = parseHexRgbArg(env, color_val, "palette colors must be #RRGGBB strings") orelse return false;
     }
 
     return true;
@@ -1071,6 +1082,24 @@ fn gtermSetPalette(
     return emacs.nil(e);
 }
 
+/// (gterm-set-default-colors TERM FOREGROUND BACKGROUND) -> nil
+/// FOREGROUND and BACKGROUND must be "#RRGGBB" strings.
+fn gtermSetDefaultColors(
+    env: ?*emacs.emacs_env,
+    _: emacs.ptrdiff_t,
+    args: [*c]emacs.emacs_value,
+    _: ?*anyopaque,
+) callconv(.c) emacs.emacs_value {
+    const e = env.?;
+    const instance = getInstanceFromArg(e, args[0]) orelse return emacs.nil(e);
+
+    const foreground = parseHexRgbArg(e, args[1], "foreground must be a #RRGGBB string") orelse return emacs.nil(e);
+    const background = parseHexRgbArg(e, args[2], "background must be a #RRGGBB string") orelse return emacs.nil(e);
+
+    instance.setDefaultColors(foreground, background);
+    return emacs.nil(e);
+}
+
 /// (gterm-free TERM) -> nil
 fn gtermFree(
     env: ?*emacs.emacs_env,
@@ -1224,6 +1253,10 @@ export fn emacs_module_init(runtime: ?*emacs.emacs_runtime) callconv(.c) c_int {
         "Set the 16-color ANSI palette for terminal TERM.\nCOLORS must be a list of exactly 16 #RRGGBB strings.",
     );
 
+    emacs.defun(env, "gterm-set-default-colors", 3, 3, &gtermSetDefaultColors,
+        "Set default foreground and background colors for terminal TERM.\nFOREGROUND and BACKGROUND must be #RRGGBB strings.",
+    );
+
     emacs.defun(env, "gterm-free", 1, 1, &gtermFree,
         "Free a gterm terminal instance.\nTERM is a terminal handle from `gterm-new'.\nThis is optional; the GC finalizer also handles cleanup.",
     );
@@ -1314,4 +1347,20 @@ test "set 16-color palette" {
     try std.testing.expectEqual(@as(u8, 0x34), instance.terminal.colors.palette.current[4].g);
     try std.testing.expectEqual(@as(u8, 0x56), instance.terminal.colors.palette.current[4].b);
     try std.testing.expectEqual(@as(u8, 0x12), instance.terminal.colors.palette.original[4].r);
+}
+
+test "set default foreground and background colors" {
+    const instance = try GtermInstance.init(80, 24);
+    defer instance.deinit();
+
+    instance.setDefaultColors(.{ .r = 0xab, .g = 0xcd, .b = 0xef }, .{ .r = 0x12, .g = 0x34, .b = 0x56 });
+
+    const foreground = instance.terminal.colors.foreground.get().?;
+    const background = instance.terminal.colors.background.get().?;
+    try std.testing.expectEqual(@as(u8, 0xab), foreground.r);
+    try std.testing.expectEqual(@as(u8, 0xcd), foreground.g);
+    try std.testing.expectEqual(@as(u8, 0xef), foreground.b);
+    try std.testing.expectEqual(@as(u8, 0x12), background.r);
+    try std.testing.expectEqual(@as(u8, 0x34), background.g);
+    try std.testing.expectEqual(@as(u8, 0x56), background.b);
 }

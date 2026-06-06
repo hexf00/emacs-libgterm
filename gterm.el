@@ -165,6 +165,18 @@ terminal creation, before the shell process starts."
                  (repeat :tag "ANSI 16-color palette" string))
   :group 'gterm)
 
+(defcustom gterm-default-foreground nil
+  "Optional default foreground color for gterm as a #RRGGBB string."
+  :type '(choice (const :tag "Use host terminal default" nil)
+                 string)
+  :group 'gterm)
+
+(defcustom gterm-default-background nil
+  "Optional default background color for gterm as a #RRGGBB string."
+  :type '(choice (const :tag "Use host terminal default" nil)
+                 string)
+  :group 'gterm)
+
 ;; ── Internal state ──────────────────────────────────────────────────────
 
 (defvar-local gterm--term nil
@@ -770,17 +782,20 @@ Event format: (drag-n-drop POSITION (file OPERATIONS PATH...))."
         (setq gterm--width cols
               gterm--height rows
               gterm--term (gterm-new cols rows))
+        (when (and gterm-default-foreground gterm-default-background)
+          (gterm-set-default-colors
+           gterm--term gterm-default-foreground gterm-default-background))
         (when gterm-color-palette
           (gterm-set-palette gterm--term gterm-color-palette))
         ;; Start shell process. `stty sane' runs before the interactive shell
         ;; appears, so input echo is initialized without leaving a command in
         ;; the visible terminal history.
-        (let ((process-environment
-               (append
-                (list (format "TERM=%s" gterm-term-environment-variable)
-                      (format "COLUMNS=%d" cols)
-                      (format "LINES=%d" rows))
-                process-environment)))
+        (let ((process-environment (copy-sequence process-environment)))
+          (setenv "TERM" gterm-term-environment-variable)
+          (setenv "COLORTERM" "truecolor")
+          (setenv "COLUMNS" (number-to-string cols))
+          (setenv "LINES" (number-to-string rows))
+          (setenv "NO_COLOR" nil)
           (setq gterm--process
                 (make-process
                  :name "gterm"

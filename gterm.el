@@ -156,6 +156,15 @@ Automatically clones Ghostty if vendor/ghostty is not present."
   :type 'integer
   :group 'gterm)
 
+(defcustom gterm-color-palette nil
+  "Optional ANSI 16-color palette for gterm.
+When non-nil, this must be a list of exactly 16 strings in #RRGGBB
+format.  The palette is passed to the native Ghostty VT instance after
+terminal creation, before the shell process starts."
+  :type '(choice (const :tag "Use Ghostty default palette" nil)
+                 (repeat :tag "ANSI 16-color palette" string))
+  :group 'gterm)
+
 ;; ── Internal state ──────────────────────────────────────────────────────
 
 (defvar-local gterm--term nil
@@ -242,15 +251,19 @@ PROCESS is the shell process. OUTPUT is the raw string."
           ;; This coalesces rapid output chunks into a single render.
           (gterm--schedule-refresh))))))
 
-(defun gterm--sentinel (process _event)
+(defun gterm--sentinel (process event)
   "Process sentinel: clean up when the shell exits.
 PROCESS is the shell process."
   (when-let* ((buf (process-buffer process)))
     (when (buffer-live-p buf)
-      (with-current-buffer buf
-        (let ((inhibit-read-only t))
-          (goto-char (point-max))
-          (insert "\n\n[Process terminated]\n"))))))
+      (if (and (eq (process-status process) 'exit)
+               (= (process-exit-status process) 0))
+          (kill-buffer buf)
+        (with-current-buffer buf
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (insert (format "\n\n[Process terminated: %s]\n"
+                            (string-trim event)))))))))
 
 ;; ── File-at-click ─────────────────────────────────────────────────────
 
@@ -757,7 +770,11 @@ Event format: (drag-n-drop POSITION (file OPERATIONS PATH...))."
         (setq gterm--width cols
               gterm--height rows
               gterm--term (gterm-new cols rows))
-        ;; Start shell process
+        (when gterm-color-palette
+          (gterm-set-palette gterm--term gterm-color-palette))
+        ;; Start shell process. `stty sane' runs before the interactive shell
+        ;; appears, so input echo is initialized without leaving a command in
+        ;; the visible terminal history.
         (let ((process-environment
                (append
                 (list (format "TERM=%s" gterm-term-environment-variable)
@@ -768,7 +785,10 @@ Event format: (drag-n-drop POSITION (file OPERATIONS PATH...))."
                 (make-process
                  :name "gterm"
                  :buffer buf
-                 :command (list gterm-shell "-l")
+                 :command (list "/bin/sh" "-lc"
+                                "stty sane 2>/dev/null; exec \"$0\" -l"
+                                gterm-shell)
+                 :connection-type 'pty
                  :coding 'no-conversion
                  :filter #'gterm--filter
                  :sentinel #'gterm--sentinel

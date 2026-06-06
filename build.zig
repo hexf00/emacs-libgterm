@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/gterm.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     // Add Emacs module header include path.

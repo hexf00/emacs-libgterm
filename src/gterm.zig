@@ -284,9 +284,19 @@ const GtermInstance = struct {
         self.cols = cols;
         self.rows = rows;
     }
+
+    pub fn setPalette(self: *GtermInstance, palette: color.Palette) void {
+        self.terminal.colors.palette.changeDefault(palette);
+        self.terminal.flags.dirty.palette = true;
+    }
 };
 
 // ── Color and style helpers ─────────────────────────────────────────
+
+const TerminalDefaults = struct {
+    foreground: ?color.RGB,
+    background: ?color.RGB,
+};
 
 const hex_chars = "0123456789abcdef";
 
@@ -313,17 +323,27 @@ fn resolveColor(env: *emacs.emacs_env, col: Style.Color, palette: *const color.P
 }
 
 /// Build a face property list from a Style. Returns nil for default style.
-fn buildFacePlist(env: *emacs.emacs_env, style: *const Style, palette: *const color.Palette) emacs.emacs_value {
+fn buildFacePlist(
+    env: *emacs.emacs_env,
+    style: *const Style,
+    palette: *const color.Palette,
+    defaults: TerminalDefaults,
+) emacs.emacs_value {
     var plist_items: [16]emacs.emacs_value = undefined;
     var n: usize = 0;
 
     // Handle inverse: swap fg/bg
     var fg = style.fg_color;
     var bg = style.bg_color;
+    var default_fg = defaults.foreground;
+    var default_bg = defaults.background;
     if (style.flags.inverse) {
         const tmp = fg;
         fg = bg;
         bg = tmp;
+        const tmp_default = default_fg;
+        default_fg = default_bg;
+        default_bg = tmp_default;
     }
 
     // Foreground color
@@ -332,6 +352,11 @@ fn buildFacePlist(env: *emacs.emacs_env, style: *const Style, palette: *const co
         n += 1;
         plist_items[n] = resolveColor(env, fg, palette);
         n += 1;
+    } else if (default_fg) |rgb| {
+        plist_items[n] = sym_foreground;
+        n += 1;
+        plist_items[n] = rgbToEmacsStr(env, rgb);
+        n += 1;
     }
 
     // Background color
@@ -339,6 +364,11 @@ fn buildFacePlist(env: *emacs.emacs_env, style: *const Style, palette: *const co
         plist_items[n] = sym_background;
         n += 1;
         plist_items[n] = resolveColor(env, bg, palette);
+        n += 1;
+    } else if (default_bg) |rgb| {
+        plist_items[n] = sym_background;
+        n += 1;
+        plist_items[n] = rgbToEmacsStr(env, rgb);
         n += 1;
     }
 
@@ -397,6 +427,10 @@ fn gtermRender(
     const screen = instance.terminal.screens.active;
     const page_list = &screen.pages;
     const palette = &instance.terminal.colors.palette.current;
+    const defaults: TerminalDefaults = .{
+        .foreground = instance.terminal.colors.foreground.get(),
+        .background = instance.terminal.colors.background.get(),
+    };
     const cols = instance.cols;
     const rows = instance.rows;
     const default_style_id = 0;
@@ -427,13 +461,11 @@ fn gtermRender(
         const page_row = page.getRow(pin.y);
         const page_cells = page.getCells(page_row);
 
-        // Find last non-empty column
-        var last_non_empty: usize = 0;
-        for (0..@min(cols, page_cells.len)) |c| {
-            const cell = &page_cells[c];
-            if (cell.wide == .spacer_tail) continue;
-            if (cell.codepoint() != 0) last_non_empty = c + 1;
-        }
+        // Render the full viewport width. TUI programs clear old content by
+        // painting blank cells and relying on the terminal to erase the rest
+        // of the visual row. If we trim trailing blank cells, Emacs may leave
+        // stale terminal pixels or miss background-only cells.
+        const last_non_empty: usize = cols;
 
         var current_style_id: u16 = default_style_id;
         var current_link_id: u16 = 0; // 0 = no hyperlink
@@ -462,7 +494,7 @@ fn gtermRender(
 
             // Style or hyperlink change: flush the current run
             if (cell.style_id != current_style_id or cell_link_id != current_link_id) {
-                flushRun(env, &run_buf, current_style_id, page, palette);
+                flushRun(env, &run_buf, current_style_id, page, palette, defaults);
                 // Apply hyperlink properties to the flushed run if it was a link
                 if (current_link_id != 0) {
                     const link_end = emacs.point(env);
@@ -477,7 +509,7 @@ fn gtermRender(
 
             // Capture cursor position when we reach the cursor column
             if (row == cursor_row and col == cursor_col and cursor_col > 0) {
-                flushRun(env, &run_buf, current_style_id, page, palette);
+                flushRun(env, &run_buf, current_style_id, page, palette, defaults);
                 if (current_link_id != 0) {
                     const link_end = emacs.point(env);
                     applyHyperlink(env, link_start, link_end, page, current_link_id);
@@ -508,7 +540,7 @@ fn gtermRender(
 
         // Apply hyperlink to final run of the row if needed
         if (current_link_id != 0) {
-            flushRun(env, &run_buf, current_style_id, page, palette);
+            flushRun(env, &run_buf, current_style_id, page, palette, defaults);
             const link_end = emacs.point(env);
             applyHyperlink(env, link_start, link_end, page, current_link_id);
             current_link_id = 0;
@@ -517,7 +549,7 @@ fn gtermRender(
         // If cursor is past the last non-empty cell on this row,
         // flush and record position
         if (row == cursor_row and cursor_col >= last_non_empty and env.is_not_nil.?(env, cursor_point) == false) {
-            flushRun(env, &run_buf, current_style_id, page, palette);
+            flushRun(env, &run_buf, current_style_id, page, palette, defaults);
             // Insert spaces up to cursor column
             const spaces_needed = cursor_col - @as(u16, @intCast(last_non_empty));
             if (spaces_needed > 0) {
@@ -531,7 +563,7 @@ fn gtermRender(
         }
 
         // Flush remaining run for this row
-        flushRun(env, &run_buf, current_style_id, page, palette);
+        flushRun(env, &run_buf, current_style_id, page, palette, defaults);
 
         // Newline after each row
         const nl = env.make_string.?(env, "\n", 1);
@@ -552,6 +584,7 @@ fn flushRun(
     style_id: u16,
     page: *const page_mod.Page,
     palette: *const color.Palette,
+    defaults: TerminalDefaults,
 ) void {
     if (run_buf.items.len == 0) return;
 
@@ -560,13 +593,10 @@ fn flushRun(
     emacs.insert(env, str);
     const end = emacs.point(env);
 
-    // Apply face if non-default style
-    if (style_id != 0) {
-        const style = page.styles.get(page.memory, style_id);
-        const face = buildFacePlist(env, style, palette);
-        if (!emacs.check_exit(env) and env.is_not_nil.?(env, face)) {
-            emacs.put_text_property(env, start, end, sym_face, face);
-        }
+    const style = if (style_id != 0) page.styles.get(page.memory, style_id) else &Style{};
+    const face = buildFacePlist(env, style, palette, defaults);
+    if (!emacs.check_exit(env) and env.is_not_nil.?(env, face)) {
+        emacs.put_text_property(env, start, end, sym_face, face);
     }
 
     run_buf.clearRetainingCapacity();
@@ -614,6 +644,10 @@ fn gtermRenderDirty(
     const screen = instance.terminal.screens.active;
     const page_list = &screen.pages;
     const palette = &instance.terminal.colors.palette.current;
+    const defaults: TerminalDefaults = .{
+        .foreground = instance.terminal.colors.foreground.get(),
+        .background = instance.terminal.colors.background.get(),
+    };
     const cols = instance.cols;
     const rows = instance.rows;
 
@@ -679,13 +713,8 @@ fn gtermRenderDirty(
         const page_row = page.getRow(pin.y);
         const page_cells = page.getCells(page_row);
 
-        // Find last non-empty column
-        var last_non_empty: usize = 0;
-        for (0..@min(cols, page_cells.len)) |c| {
-            const cell = &page_cells[c];
-            if (cell.wide == .spacer_tail) continue;
-            if (cell.codepoint() != 0) last_non_empty = c + 1;
-        }
+        // Keep dirty rendering consistent with full rendering.
+        const last_non_empty: usize = cols;
 
         var current_style_id: u16 = 0;
         run_buf.clearRetainingCapacity();
@@ -703,13 +732,13 @@ fn gtermRenderDirty(
             }
 
             if (cell.style_id != current_style_id) {
-                flushRun(env, &run_buf, current_style_id, page, palette);
+                flushRun(env, &run_buf, current_style_id, page, palette, defaults);
                 current_style_id = cell.style_id;
             }
 
             // Capture cursor position
             if (row == cursor_row and col == cursor_col and cursor_col > 0) {
-                flushRun(env, &run_buf, current_style_id, page, palette);
+                flushRun(env, &run_buf, current_style_id, page, palette, defaults);
                 cursor_point = emacs.point(env);
             }
 
@@ -734,7 +763,7 @@ fn gtermRenderDirty(
 
         // Cursor past end of content
         if (row == cursor_row and cursor_col >= last_non_empty and env.is_not_nil.?(env, cursor_point) == false) {
-            flushRun(env, &run_buf, current_style_id, page, palette);
+            flushRun(env, &run_buf, current_style_id, page, palette, defaults);
             const spaces_needed = cursor_col - @as(u16, @intCast(last_non_empty));
             if (spaces_needed > 0) {
                 var space_buf: [256]u8 = undefined;
@@ -746,7 +775,7 @@ fn gtermRenderDirty(
             cursor_point = emacs.point(env);
         }
 
-        flushRun(env, &run_buf, current_style_id, page, palette);
+        flushRun(env, &run_buf, current_style_id, page, palette, defaults);
 
         // Mark row as clean
         pin.rowAndCell().row.dirty = false;
@@ -769,6 +798,74 @@ fn getInstanceFromArg(env: *emacs.emacs_env, arg: emacs.emacs_value) ?*GtermInst
     const ptr = env.get_user_ptr.?(env, arg);
     if (emacs.check_exit(env)) return null;
     return @ptrCast(@alignCast(ptr));
+}
+
+fn parseHexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+fn parseHexByte(s: []const u8, offset: usize) ?u8 {
+    const hi = parseHexNibble(s[offset]) orelse return null;
+    const lo = parseHexNibble(s[offset + 1]) orelse return null;
+    return (hi << 4) | lo;
+}
+
+fn parseHexRgb(s: []const u8) ?color.RGB {
+    if (s.len != 7 or s[0] != '#') return null;
+    return .{
+        .r = parseHexByte(s, 1) orelse return null,
+        .g = parseHexByte(s, 3) orelse return null,
+        .b = parseHexByte(s, 5) orelse return null,
+    };
+}
+
+fn parsePalette16(env: *emacs.emacs_env, arg: emacs.emacs_value, out: *color.Palette) bool {
+    var length_args = [_]emacs.emacs_value{arg};
+    const length_val = env.funcall.?(env, env.intern.?(env, "length"), 1, &length_args);
+    if (emacs.check_exit(env)) return false;
+
+    const length = env.extract_integer.?(env, length_val);
+    if (emacs.check_exit(env)) return false;
+    if (length != 16) {
+        emacs.signal_error(env, "wrong-type-argument", "palette must contain exactly 16 #RRGGBB strings");
+        return false;
+    }
+
+    out.* = color.default;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        var nth_args = [_]emacs.emacs_value{
+            env.make_integer.?(env, @intCast(i)),
+            arg,
+        };
+        const color_val = env.funcall.?(env, env.intern.?(env, "nth"), 2, &nth_args);
+        if (emacs.check_exit(env)) return false;
+
+        var len: emacs.ptrdiff_t = 0;
+        _ = env.copy_string_contents.?(env, color_val, null, &len);
+        if (emacs.check_exit(env)) return false;
+        if (len != 8) {
+            emacs.signal_error(env, "wrong-type-argument", "palette colors must be #RRGGBB strings");
+            return false;
+        }
+
+        var buf: [8]u8 = undefined;
+        var copy_len = len;
+        _ = env.copy_string_contents.?(env, color_val, &buf, &copy_len);
+        if (emacs.check_exit(env)) return false;
+
+        out[i] = parseHexRgb(buf[0..7]) orelse {
+            emacs.signal_error(env, "wrong-type-argument", "palette colors must be #RRGGBB strings");
+            return false;
+        };
+    }
+
+    return true;
 }
 
 // ── Emacs module functions ──────────────────────────────────────────────
@@ -908,6 +1005,24 @@ fn gtermResize(
     return emacs.nil(e);
 }
 
+/// (gterm-set-palette TERM COLORS) -> nil
+/// COLORS must be a list of exactly 16 "#RRGGBB" strings.
+fn gtermSetPalette(
+    env: ?*emacs.emacs_env,
+    _: emacs.ptrdiff_t,
+    args: [*c]emacs.emacs_value,
+    _: ?*anyopaque,
+) callconv(.c) emacs.emacs_value {
+    const e = env.?;
+    const instance = getInstanceFromArg(e, args[0]) orelse return emacs.nil(e);
+
+    var palette: color.Palette = undefined;
+    if (!parsePalette16(e, args[1], &palette)) return emacs.nil(e);
+
+    instance.setPalette(palette);
+    return emacs.nil(e);
+}
+
 /// (gterm-free TERM) -> nil
 fn gtermFree(
     env: ?*emacs.emacs_env,
@@ -918,6 +1033,8 @@ fn gtermFree(
     const e = env.?;
     const instance = getInstanceFromArg(e, args[0]) orelse return emacs.nil(e);
     instance.deinit();
+    allocator.destroy(instance);
+    e.set_user_ptr.?(e, args[0], null);
     return emacs.nil(e);
 }
 
@@ -1057,6 +1174,10 @@ export fn emacs_module_init(runtime: ?*emacs.emacs_runtime) callconv(.c) c_int {
         "Resize a gterm terminal to COLS columns and ROWS rows.\nTERM is a terminal handle from `gterm-new'.",
     );
 
+    emacs.defun(env, "gterm-set-palette", 2, 2, &gtermSetPalette,
+        "Set the 16-color ANSI palette for terminal TERM.\nCOLORS must be a list of exactly 16 #RRGGBB strings.",
+    );
+
     emacs.defun(env, "gterm-free", 1, 1, &gtermFree,
         "Free a gterm terminal instance.\nTERM is a terminal handle from `gterm-new'.\nThis is optional; the GC finalizer also handles cleanup.",
     );
@@ -1133,4 +1254,18 @@ test "resize terminal" {
     try instance.resize(120, 40);
     try std.testing.expectEqual(@as(u16, 120), instance.cols);
     try std.testing.expectEqual(@as(u16, 40), instance.rows);
+}
+
+test "set 16-color palette" {
+    const instance = try GtermInstance.init(80, 24);
+    defer instance.deinit();
+
+    var palette = color.default;
+    palette[4] = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
+    instance.setPalette(palette);
+
+    try std.testing.expectEqual(@as(u8, 0x12), instance.terminal.colors.palette.current[4].r);
+    try std.testing.expectEqual(@as(u8, 0x34), instance.terminal.colors.palette.current[4].g);
+    try std.testing.expectEqual(@as(u8, 0x56), instance.terminal.colors.palette.current[4].b);
+    try std.testing.expectEqual(@as(u8, 0x12), instance.terminal.colors.palette.original[4].r);
 }

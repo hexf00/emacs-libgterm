@@ -177,6 +177,21 @@ terminal creation, before the shell process starts."
                  string)
   :group 'gterm)
 
+(defcustom gterm-osc-query-foreground nil
+  "Optional foreground color returned for OSC 10 color queries.
+When non-nil, this must be a #RRGGBB string.  Programs such as Codex query
+the terminal default colors before deciding their own UI colors."
+  :type '(choice (const :tag "Do not answer OSC 10" nil)
+                 string)
+  :group 'gterm)
+
+(defcustom gterm-osc-query-background nil
+  "Optional background color returned for OSC 11 color queries.
+When non-nil, this must be a #RRGGBB string."
+  :type '(choice (const :tag "Do not answer OSC 11" nil)
+                 string)
+  :group 'gterm)
+
 ;; ── Internal state ──────────────────────────────────────────────────────
 
 (defvar-local gterm--term nil
@@ -202,6 +217,9 @@ terminal creation, before the shell process starts."
 
 (defvar-local gterm--rendered nil
   "Non-nil after the first full render has been done.")
+
+(defvar-local gterm--osc-query-tail ""
+  "Recent output suffix used to detect split OSC color queries.")
 
 ;; ── Buffer rendering ────────────────────────────────────────────────────
 
@@ -247,6 +265,41 @@ pending PTY output before rendering, preventing backpressure."
 
 ;; ── Process filter ──────────────────────────────────────────────────────
 
+(defun gterm--hex-color-to-osc-rgb (color)
+  "Convert #RRGGBB COLOR to xterm OSC rgb:RRRR/GGGG/BBBB format."
+  (when (and (stringp color)
+             (string-match-p "\\`#[[:xdigit:]]\\{6\\}\\'" color))
+    (let ((r (substring color 1 3))
+          (g (substring color 3 5))
+          (b (substring color 5 7)))
+      (format "rgb:%s%s/%s%s/%s%s" r r g g b b))))
+
+(defun gterm--osc-color-query-response (query color)
+  "Return an OSC color response for QUERY and COLOR, or nil."
+  (when-let ((rgb (gterm--hex-color-to-osc-rgb color)))
+    (format "\e]%s;%s\e\\" query rgb)))
+
+(defun gterm--answer-osc-color-queries (process output)
+  "Answer OSC 10/11 color queries from PROCESS found in OUTPUT."
+  (let ((data (concat gterm--osc-query-tail output)))
+    (when (and gterm-osc-query-foreground
+               (or (string-search (concat "\e]10;?" "\a") data)
+                   (string-search (concat "\e]10;?" "\e\\") data)))
+      (when-let ((response (gterm--osc-color-query-response
+                            "10" gterm-osc-query-foreground)))
+        (process-send-string process response)))
+    (when (and gterm-osc-query-background
+               (or (string-search (concat "\e]11;?" "\a") data)
+                   (string-search (concat "\e]11;?" "\e\\") data)))
+      (when-let ((response (gterm--osc-color-query-response
+                            "11" gterm-osc-query-background)))
+        (process-send-string process response)))
+    ;; Keep enough bytes to catch ESC ] 10 ; ? ESC \\ split across chunks.
+    (setq gterm--osc-query-tail
+          (if (> (length data) 16)
+              (substring data (- (length data) 16))
+            data))))
+
 (defun gterm--filter (process output)
   "Process filter: feed shell output into the terminal and refresh.
 PROCESS is the shell process. OUTPUT is the raw string."
@@ -254,6 +307,7 @@ PROCESS is the shell process. OUTPUT is the raw string."
     (when (buffer-live-p buf)
       (with-current-buffer buf
         (when gterm--term
+          (gterm--answer-osc-color-queries process output)
           (gterm-feed gterm--term output)
           ;; Only auto-scroll to bottom if we were already at bottom
           (unless gterm--scrollback-p

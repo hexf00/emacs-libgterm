@@ -298,6 +298,51 @@ const TerminalDefaults = struct {
     background: ?color.RGB,
 };
 
+const RenderStyle = union(enum) {
+    style_id: u16,
+    bg_rgb: color.RGB,
+    bg_palette: u8,
+};
+
+fn cellRenderStyle(cell: *const page_mod.Cell) RenderStyle {
+    return switch (cell.content_tag) {
+        .bg_color_rgb => .{ .bg_rgb = .{
+            .r = cell.content.color_rgb.r,
+            .g = cell.content.color_rgb.g,
+            .b = cell.content.color_rgb.b,
+        } },
+        .bg_color_palette => .{ .bg_palette = cell.content.color_palette },
+        else => .{ .style_id = cell.style_id },
+    };
+}
+
+fn renderStyleEql(left: RenderStyle, right: RenderStyle) bool {
+    return switch (left) {
+        .style_id => |left_id| switch (right) {
+            .style_id => |right_id| left_id == right_id,
+            else => false,
+        },
+        .bg_rgb => |left_rgb| switch (right) {
+            .bg_rgb => |right_rgb| left_rgb.r == right_rgb.r and
+                left_rgb.g == right_rgb.g and
+                left_rgb.b == right_rgb.b,
+            else => false,
+        },
+        .bg_palette => |left_palette| switch (right) {
+            .bg_palette => |right_palette| left_palette == right_palette,
+            else => false,
+        },
+    };
+}
+
+fn styleForRenderStyle(render_style: RenderStyle, page: *const page_mod.Page) Style {
+    return switch (render_style) {
+        .style_id => |style_id| if (style_id != 0) page.styles.get(page.memory, style_id).* else .{},
+        .bg_rgb => |rgb| .{ .bg_color = .{ .rgb = rgb } },
+        .bg_palette => |palette_idx| .{ .bg_color = .{ .palette = palette_idx } },
+    };
+}
+
 const hex_chars = "0123456789abcdef";
 
 /// Convert RGB to a "#RRGGBB" Emacs string.
@@ -433,7 +478,7 @@ fn gtermRender(
     };
     const cols = instance.cols;
     const rows = instance.rows;
-    const default_style_id = 0;
+    const default_render_style = RenderStyle{ .style_id = 0 };
 
     // Get cursor position to track during rendering
     const cursor_row: u16 = @intCast(screen.cursor.y);
@@ -467,7 +512,7 @@ fn gtermRender(
         // stale terminal pixels or miss background-only cells.
         const last_non_empty: usize = cols;
 
-        var current_style_id: u16 = default_style_id;
+        var current_render_style = default_render_style;
         var current_link_id: u16 = 0; // 0 = no hyperlink
         var link_start: emacs.emacs_value = emacs.nil(env);
         run_buf.clearRetainingCapacity();
@@ -492,15 +537,17 @@ fn gtermRender(
             else
                 0;
 
+            const render_style = cellRenderStyle(cell);
+
             // Style or hyperlink change: flush the current run
-            if (cell.style_id != current_style_id or cell_link_id != current_link_id) {
-                flushRun(env, &run_buf, current_style_id, page, palette, defaults);
+            if (!renderStyleEql(render_style, current_render_style) or cell_link_id != current_link_id) {
+                flushRun(env, &run_buf, current_render_style, page, palette, defaults);
                 // Apply hyperlink properties to the flushed run if it was a link
                 if (current_link_id != 0) {
                     const link_end = emacs.point(env);
                     applyHyperlink(env, link_start, link_end, page, current_link_id);
                 }
-                current_style_id = cell.style_id;
+                current_render_style = render_style;
                 current_link_id = cell_link_id;
                 if (cell_link_id != 0) {
                     link_start = emacs.point(env);
@@ -509,7 +556,7 @@ fn gtermRender(
 
             // Capture cursor position when we reach the cursor column
             if (row == cursor_row and col == cursor_col and cursor_col > 0) {
-                flushRun(env, &run_buf, current_style_id, page, palette, defaults);
+                flushRun(env, &run_buf, current_render_style, page, palette, defaults);
                 if (current_link_id != 0) {
                     const link_end = emacs.point(env);
                     applyHyperlink(env, link_start, link_end, page, current_link_id);
@@ -519,7 +566,7 @@ fn gtermRender(
             }
 
             const cp = cell.codepoint();
-            if (cp == 0) {
+            if (cell.content_tag == .bg_color_rgb or cell.content_tag == .bg_color_palette or cp == 0) {
                 run_buf.append(' ') catch {};
             } else {
                 var utf8_buf: [4]u8 = undefined;
@@ -540,7 +587,7 @@ fn gtermRender(
 
         // Apply hyperlink to final run of the row if needed
         if (current_link_id != 0) {
-            flushRun(env, &run_buf, current_style_id, page, palette, defaults);
+            flushRun(env, &run_buf, current_render_style, page, palette, defaults);
             const link_end = emacs.point(env);
             applyHyperlink(env, link_start, link_end, page, current_link_id);
             current_link_id = 0;
@@ -549,7 +596,7 @@ fn gtermRender(
         // If cursor is past the last non-empty cell on this row,
         // flush and record position
         if (row == cursor_row and cursor_col >= last_non_empty and env.is_not_nil.?(env, cursor_point) == false) {
-            flushRun(env, &run_buf, current_style_id, page, palette, defaults);
+            flushRun(env, &run_buf, current_render_style, page, palette, defaults);
             // Insert spaces up to cursor column
             const spaces_needed = cursor_col - @as(u16, @intCast(last_non_empty));
             if (spaces_needed > 0) {
@@ -563,7 +610,7 @@ fn gtermRender(
         }
 
         // Flush remaining run for this row
-        flushRun(env, &run_buf, current_style_id, page, palette, defaults);
+        flushRun(env, &run_buf, current_render_style, page, palette, defaults);
 
         // Newline after each row
         const nl = env.make_string.?(env, "\n", 1);
@@ -581,7 +628,7 @@ fn gtermRender(
 fn flushRun(
     env: *emacs.emacs_env,
     run_buf: *std.array_list.Managed(u8),
-    style_id: u16,
+    render_style: RenderStyle,
     page: *const page_mod.Page,
     palette: *const color.Palette,
     defaults: TerminalDefaults,
@@ -593,8 +640,8 @@ fn flushRun(
     emacs.insert(env, str);
     const end = emacs.point(env);
 
-    const style = if (style_id != 0) page.styles.get(page.memory, style_id) else &Style{};
-    const face = buildFacePlist(env, style, palette, defaults);
+    const style = styleForRenderStyle(render_style, page);
+    const face = buildFacePlist(env, &style, palette, defaults);
     if (!emacs.check_exit(env) and env.is_not_nil.?(env, face)) {
         emacs.put_text_property(env, start, end, sym_face, face);
     }
@@ -716,7 +763,7 @@ fn gtermRenderDirty(
         // Keep dirty rendering consistent with full rendering.
         const last_non_empty: usize = cols;
 
-        var current_style_id: u16 = 0;
+        var current_render_style = RenderStyle{ .style_id = 0 };
         run_buf.clearRetainingCapacity();
 
         var col: usize = 0;
@@ -731,19 +778,20 @@ fn gtermRenderDirty(
                 continue;
             }
 
-            if (cell.style_id != current_style_id) {
-                flushRun(env, &run_buf, current_style_id, page, palette, defaults);
-                current_style_id = cell.style_id;
+            const render_style = cellRenderStyle(cell);
+            if (!renderStyleEql(render_style, current_render_style)) {
+                flushRun(env, &run_buf, current_render_style, page, palette, defaults);
+                current_render_style = render_style;
             }
 
             // Capture cursor position
             if (row == cursor_row and col == cursor_col and cursor_col > 0) {
-                flushRun(env, &run_buf, current_style_id, page, palette, defaults);
+                flushRun(env, &run_buf, current_render_style, page, palette, defaults);
                 cursor_point = emacs.point(env);
             }
 
             const cp = cell.codepoint();
-            if (cp == 0) {
+            if (cell.content_tag == .bg_color_rgb or cell.content_tag == .bg_color_palette or cp == 0) {
                 run_buf.append(' ') catch {};
             } else {
                 var utf8_buf: [4]u8 = undefined;
@@ -763,7 +811,7 @@ fn gtermRenderDirty(
 
         // Cursor past end of content
         if (row == cursor_row and cursor_col >= last_non_empty and env.is_not_nil.?(env, cursor_point) == false) {
-            flushRun(env, &run_buf, current_style_id, page, palette, defaults);
+            flushRun(env, &run_buf, current_render_style, page, palette, defaults);
             const spaces_needed = cursor_col - @as(u16, @intCast(last_non_empty));
             if (spaces_needed > 0) {
                 var space_buf: [256]u8 = undefined;
@@ -775,7 +823,7 @@ fn gtermRenderDirty(
             cursor_point = emacs.point(env);
         }
 
-        flushRun(env, &run_buf, current_style_id, page, palette, defaults);
+        flushRun(env, &run_buf, current_render_style, page, palette, defaults);
 
         // Mark row as clean
         pin.rowAndCell().row.dirty = false;
@@ -1033,8 +1081,6 @@ fn gtermFree(
     const e = env.?;
     const instance = getInstanceFromArg(e, args[0]) orelse return emacs.nil(e);
     instance.deinit();
-    allocator.destroy(instance);
-    e.set_user_ptr.?(e, args[0], null);
     return emacs.nil(e);
 }
 
